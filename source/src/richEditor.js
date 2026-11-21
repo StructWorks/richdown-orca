@@ -1,0 +1,577 @@
+// Rich editor webview entrypoint.
+//
+// Keep this file focused on bootstrapping the host/CodeMirror integration. Rich
+// Markdown parsing, preview widgets, settings UI, and decorations live in
+// feature modules under src/rich-editor so contributors can change one area
+// without learning the whole editor surface. The host is VS Code's webview
+// unless another embedder installed one first (see adapters/editorHost.js).
+import {
+  defaultKeymap,
+  history,
+  historyKeymap,
+  indentWithTab,
+} from "@codemirror/commands";
+import { markdown } from "@codemirror/lang-markdown";
+import { yamlFrontmatter } from "@codemirror/lang-yaml";
+import { syntaxHighlighting } from "@codemirror/language";
+import { EditorState } from "@codemirror/state";
+import {
+  EditorView,
+  highlightActiveLineGutter,
+  keymap,
+  lineNumbers,
+} from "@codemirror/view";
+import { GFM } from "@lezer/markdown";
+import { resolveEditorHost } from "./rich-editor/adapters/editorHost.js";
+import { applySettingsPatch } from "./rich-editor/application/settingsUseCases.js";
+import { normalizeRichEditorSettings } from "./rich-editor/domain/settingsModel.js";
+import {
+  getMinimalTextChange,
+  mapPositionThroughTextChange,
+  normalizeLineEndings,
+} from "./rich-editor/domain/textChange.js";
+import {
+  codeLanguages,
+  markdownHighlightStyle,
+} from "./rich-editor/presentation/codemirror/language.js";
+import { createMarkdownCompletion } from "./rich-editor/presentation/codemirror/completions.js";
+import { blockSelectionHighlight } from "./rich-editor/presentation/codemirror/blockSelection.js";
+import { createGitDiffGutter } from "./rich-editor/presentation/codemirror/gitDiffGutter.js";
+import { createHeadingCursorFilter } from "./rich-editor/presentation/codemirror/headingCursor.js";
+import { createLintDecorations } from "./rich-editor/presentation/codemirror/lintDecorations.js";
+import { findLinkAtClick } from "./rich-editor/presentation/codemirror/links.js";
+import { pointerSelectionFocus } from "./rich-editor/presentation/codemirror/pointerSelectionFocus.js";
+import { createWikilinkResolver } from "./rich-editor/presentation/markdown/wikilinkResolver.js";
+import { createSlashCommandController } from "./rich-editor/presentation/codemirror/slashCommands.js";
+import {
+  tableKeymap,
+  tablePreviewEntryKeymap,
+} from "./rich-editor/presentation/codemirror/tableKeymap.js";
+import { createPreviewExtensions } from "./rich-editor/presentation/codemirror/previewExtensions.js";
+import { createChatEditsBanner } from "./rich-editor/presentation/chatEdits/chatEditsBanner.js";
+import { createFallbackEditor } from "./rich-editor/presentation/fallback/fallbackEditor.js";
+import { createInlineMarkdownSupport } from "./rich-editor/presentation/markdown/inlineMarkdown.js";
+import { createOutlineNavigation } from "./rich-editor/presentation/outline/outlineNavigation.js";
+import {
+  revealHighlightField,
+  revealInEditor,
+} from "./rich-editor/presentation/reveal/revealTarget.js";
+import {
+  createSearchExtensions,
+  getSearchKeymap,
+  installSearchShortcut,
+} from "./rich-editor/presentation/search/searchExtensions.js";
+import { createSettingsMenuController } from "./rich-editor/presentation/settings/settingsMenu.js";
+import {
+  applyPreviewWidth,
+  applyTheme,
+} from "./rich-editor/presentation/settings/themeController.js";
+import { createEditorThemeExtension } from "./rich-editor/presentation/styles/editorTheme.js";
+import { injectStyles } from "./rich-editor/presentation/styles/globalStyles.js";
+import { closeTableContextMenu } from "./rich-editor/presentation/table/tablePreview.js";
+
+const host = resolveEditorHost();
+const exportMode = host.exportMode === true;
+const readOnly = exportMode || host.readOnly === true;
+const root = document.querySelector("#editor");
+const initialDocument = host.initial.document ?? "";
+const initialSettings = host.initial.settings ?? {};
+const mermaidScriptUri = host.initial.mermaidScriptUri ?? "";
+const initialGitDiffChanges = host.initial.gitDiffChanges ?? [];
+const exportImageMap = host.initial.imageMap ?? {};
+const initialReveal = host.initial.reveal ?? null;
+
+let applyingExternalUpdate = false;
+// Every edit sent to the host is numbered. The host echoes the number of the
+// last edit its document reflects, so an update with a lower number was taken
+// before keystrokes that are still on their way and would undo them.
+let lastSentEditVersion = 0;
+// Lint results that arrived during an IME composition. Redrawing the marks on
+// the composing line makes CodeMirror lose track of the composition, which
+// drops the "# " before it or doubles the composed text, so they wait.
+let deferredLintMessage = null;
+let settings = normalizeRichEditorSettings(initialSettings);
+let latestGitDiffChanges = initialGitDiffChanges;
+let latestLintDiagnostics = [];
+const outlineNavigation = createOutlineNavigation();
+const fallbackEditor = createFallbackEditor({
+  root,
+  postMessage: (message) => host.postMessage(message),
+});
+const slashCommands = createSlashCommandController();
+const chatEditsBanner = createChatEditsBanner({
+  postMessage: (message) => host.postMessage(message),
+});
+const gitDiffGutter = createGitDiffGutter(initialGitDiffChanges);
+const lintDecorations = createLintDecorations();
+const settingsMenu = createSettingsMenuController({
+  getSettings: () => settings,
+  postMessage: (message) => host.postMessage(message),
+  refreshDecorations: () => previewExtensions.refresh(view),
+});
+// Exports have no host to resolve wikilink names, so links there stay plain.
+const wikilinkResolver = createWikilinkResolver({
+  postMessage: (message) => {
+    if (!exportMode) {
+      host.postMessage(message);
+    }
+  },
+  onChange: () => previewExtensions.refreshInline(view),
+});
+const inlineMarkdown = createInlineMarkdownSupport({
+  postMessage: (message) => host.postMessage(message),
+  requestEditorMeasure,
+  resolveImageSource: exportMode
+    ? resolveExportImageSource
+    : host.resolveImageSource,
+  getWikilinkStatus: (target) => wikilinkResolver.status(target),
+});
+const {
+  appendInlineMarkdown,
+  findMarkdownImages,
+  handleResolvedImage,
+  ImagePreviewWidget,
+  isRangeInsideRanges,
+  wikilinkClassName,
+} = inlineMarkdown;
+const markdownCompletion = createMarkdownCompletion({
+  postMessage: (message) => host.postMessage(message),
+});
+const previewExtensions = createPreviewExtensions({
+  appendInlineMarkdown,
+  findMarkdownImages,
+  ImagePreviewWidget,
+  isRangeInsideRanges,
+  mermaidScriptUri,
+  postMessage: (message) => host.postMessage(message),
+  reportError: reportRichdownError,
+  requestEditorMeasure,
+  getSettings: () => settings,
+  wikilinkClassName,
+});
+
+
+applyTheme(settings.richTheme);
+applyPreviewWidth(settings.previewWidth);
+injectStyles();
+if (exportMode) {
+  document.documentElement.dataset.richdownExport = "true";
+}
+
+function resolveExportImageSource(src) {
+  if (/^(https?:|data:|blob:|file:)/i.test(src)) {
+    return Promise.resolve(src);
+  }
+  if (Object.prototype.hasOwnProperty.call(exportImageMap, src)) {
+    return Promise.resolve(exportImageMap[src]);
+  }
+  try {
+    const decoded = decodeURI(src);
+    if (Object.prototype.hasOwnProperty.call(exportImageMap, decoded)) {
+      return Promise.resolve(exportImageMap[decoded]);
+    }
+  } catch (error) {
+    // Keep the original source when it is not valid URI text.
+  }
+  return Promise.reject(new Error("Image could not be resolved."));
+}
+
+function reportRichdownError(context, error) {
+  const message = error instanceof Error ? error.message : String(error);
+  const stack = error instanceof Error ? error.stack : "";
+  console.error(`[Richdown] ${context}`, error);
+  host.postMessage({
+    type: "webviewError",
+    context,
+    message,
+    stack,
+  });
+}
+
+function requestEditorMeasure(view) {
+  if (view && typeof view.requestMeasure === "function") {
+    view.requestMeasure();
+  }
+}
+
+let view;
+
+if (!exportMode) {
+  installSearchShortcut({
+    getView: () => view,
+    closeSlashCommandMenu: slashCommands.close,
+    closeTableContextMenu,
+  });
+}
+
+queueMicrotask(() => {
+  try {
+    view = new EditorView({
+      parent: root,
+      state: EditorState.create({
+        doc: initialDocument,
+        extensions: [
+          ...(exportMode
+            ? [
+                EditorState.readOnly.of(true),
+                EditorView.editable.of(false),
+              ]
+            : [
+                gitDiffGutter.extension,
+                lintDecorations.extension,
+                lineNumbers(),
+                history(),
+                // Stands in for highlightActiveLine(): the active line
+                // reveals Markdown markers, and must not change mid-drag.
+                pointerSelectionFocus,
+                blockSelectionHighlight,
+                highlightActiveLineGutter(),
+                markdownCompletion.extension,
+                createHeadingCursorFilter({
+                  isLineFocused: previewExtensions.isLineFocused,
+                }),
+                revealHighlightField,
+                ...createSearchExtensions(),
+                // A host can open a file it will not let the editor change.
+                ...(readOnly ? [EditorState.readOnly.of(true)] : []),
+              ]),
+          syntaxHighlighting(markdownHighlightStyle),
+          // Wrapping Markdown in yamlFrontmatter keeps a leading "---" header
+          // parsed as YAML instead of a setext heading or thematic break.
+          yamlFrontmatter({
+            content: markdown({
+              extensions: GFM,
+              codeLanguages,
+            }),
+          }),
+          ...previewExtensions.extensions,
+          EditorView.domEventHandlers({
+            compositionend() {
+              setTimeout(flushDeferredLint, 0);
+              return false;
+            },
+            blur(event, view) {
+              slashCommands.close();
+              previewExtensions.exitDetailsEditMode(view, true);
+              previewExtensions.exitFrontmatterEditMode(view, true);
+              previewExtensions.exitTableEditMode(view, true);
+              // The live Mermaid editor's rename box and pickers sit inside
+              // the editor; focusing them must not end diagram edit mode.
+              if (!event.relatedTarget?.closest?.(".cm-mermaid-live")) {
+                previewExtensions.exitMermaidEditMode(view, true);
+              }
+              previewExtensions.exitGherkinEditMode(view, true);
+              return false;
+            },
+            mousedown(event, view) {
+              if (event.button !== 0 || event.metaKey || event.ctrlKey) {
+                return false;
+              }
+              const linkTarget = findLinkAtClick(view, event);
+              if (!linkTarget) {
+                return false;
+              }
+              const line = view.state.doc.lineAt(linkTarget.position);
+              if (previewExtensions.isLineFocused(view.state, line)) {
+                return false;
+              }
+              event.preventDefault();
+              return true;
+            },
+            click(event, view) {
+              const linkTarget = findLinkAtClick(view, event);
+              if (!linkTarget) {
+                return false;
+              }
+
+              const line = view.state.doc.lineAt(linkTarget.position);
+              const linkNeedsModifier = previewExtensions.isLineFocused(view.state, line);
+              if (linkNeedsModifier && !event.metaKey && !event.ctrlKey) {
+                return false;
+              }
+
+              event.preventDefault();
+              host.postMessage({
+                type: linkTarget.wikilink ? "openWikilink" : "openLink",
+                href: linkTarget.href,
+              });
+              return true;
+            },
+          }),
+          ...(exportMode
+            ? []
+            : [
+                keymap.of([
+                  {
+                    // VS Code's Format Document shortcut, which the text
+                    // editor binds; a custom editor has to ask for it.
+                    key: "Shift-Alt-f",
+                    preventDefault: true,
+                    run: () => {
+                      host.postMessage({ type: "formatDocument" });
+                      return true;
+                    },
+                  },
+                  // Ahead of indentWithTab so Tab moves between table cells.
+                  ...tableKeymap,
+                  indentWithTab,
+                  ...slashCommands.keymap,
+                  // After the slash menu, which owns Up/Down while it is open.
+                  ...tablePreviewEntryKeymap,
+                  ...previewExtensions.blockPreviewEntryKeymap,
+                  ...getSearchKeymap(),
+                  ...defaultKeymap,
+                  ...historyKeymap,
+                ]),
+              ]),
+          EditorView.lineWrapping,
+          EditorView.updateListener.of((update) => {
+            slashCommands.sync(update);
+            outlineNavigation.sync(update);
+            if (deferredLintMessage && !update.view.composing) {
+              // Dispatching is not allowed inside an update listener.
+              setTimeout(flushDeferredLint, 0);
+            }
+            if (exportMode || !update.docChanged || applyingExternalUpdate) {
+              return;
+            }
+            lastSentEditVersion += 1;
+            host.postMessage({
+              type: "edit",
+              text: update.state.doc.toString(),
+              version: lastSentEditVersion,
+            });
+          }),
+          createEditorThemeExtension(),
+        ],
+      }),
+    });
+    if (!exportMode) {
+      settingsMenu.render();
+      outlineNavigation.render(view);
+      gitDiffGutter.update(view, latestGitDiffChanges);
+      lintDecorations.update(view, latestLintDiagnostics);
+      if (initialReveal) {
+        // Applied before the first paint, so the editor opens at the target
+        // instead of drawing the top of the document and then jumping.
+        revealInEditor(view, initialReveal);
+      }
+    }
+    host.postMessage({ type: "ready" });
+  } catch (error) {
+    reportRichdownError("editor-startup", error);
+    view = null;
+    fallbackEditor.render(initialDocument);
+    host.postMessage({ type: "ready" });
+  }
+});
+
+host.onMessage((message) => {
+  if (!message) return;
+
+  if (message.type === "resolvedImage") {
+    handleResolvedImage(message);
+    return;
+  }
+
+  if (message.type === "hostCompletions") {
+    markdownCompletion.handleHostCompletions(message);
+    return;
+  }
+
+  if (message.type === "linkCompletions") {
+    markdownCompletion.handleLinkCompletions(message);
+    return;
+  }
+
+  if (message.type === "wikilinkCompletions") {
+    markdownCompletion.handleWikilinkCompletions(message);
+    return;
+  }
+
+  if (message.type === "wikilinksResolved") {
+    wikilinkResolver.handleResolved(message);
+    return;
+  }
+
+  if (message.type === "wikilinksChanged") {
+    wikilinkResolver.invalidate();
+    return;
+  }
+
+  if (message.type === "reveal") {
+    if (view) {
+      revealInEditor(view, message.target);
+    }
+    return;
+  }
+
+  if (message.type === "chatEdits") {
+    chatEditsBanner.update(message.pending === true);
+    return;
+  }
+
+  if (message.type === "gitDiff") {
+    latestGitDiffChanges = message.changes || [];
+    gitDiffGutter.update(view, latestGitDiffChanges);
+    return;
+  }
+
+  if (message.type === "lintDiagnostics") {
+    handleLintDiagnostics(message);
+    return;
+  }
+
+  if (message.type === "theme") {
+    settings.richTheme = message.theme || "default";
+    applyTheme(settings.richTheme);
+    settingsMenu.update();
+    return;
+  }
+
+  if (message.type === "settings") {
+    const result = applySettingsPatch(settings, message.settings);
+    settings = result.settings;
+    applyTheme(settings.richTheme);
+    applyPreviewWidth(settings.previewWidth);
+    settingsMenu.update();
+    if (result.previewChanged) {
+      previewExtensions.refresh(view);
+    }
+    return;
+  }
+
+  if (message.type !== "update") return;
+
+  if (isStaleHostMessage(message)) {
+    // The host will receive the newer edits and replace its document with
+    // them, so this text is already superseded. Applying it would revert the
+    // latest keystrokes and break an IME composition in progress.
+    return;
+  }
+
+  // The host already sends LF text; normalizing again keeps a CRLF document
+  // from turning into stray carriage returns inside the CodeMirror document.
+  const nextText =
+    typeof message.text === "string"
+      ? normalizeLineEndings(message.text)
+      : message.text;
+  if (!view) {
+    fallbackEditor.applyUpdate(nextText);
+    return;
+  }
+  applyExternalDocumentUpdate(view, nextText);
+});
+
+function isStaleHostMessage(message) {
+  return (
+    Boolean(view) &&
+    typeof message.version === "number" &&
+    message.version < lastSentEditVersion
+  );
+}
+
+function handleLintDiagnostics(message) {
+  // Results for older text would land on the wrong characters. The host lints
+  // again after the newer edits arrive, so nothing is lost by dropping them.
+  if (isStaleHostMessage(message)) {
+    return;
+  }
+  if (view?.composing) {
+    deferredLintMessage = message;
+    return;
+  }
+  latestLintDiagnostics = message.diagnostics || [];
+  lintDecorations.update(view, latestLintDiagnostics);
+}
+
+function flushDeferredLint() {
+  if (!deferredLintMessage || !view || view.composing) {
+    return;
+  }
+  const message = deferredLintMessage;
+  deferredLintMessage = null;
+  handleLintDiagnostics(message);
+}
+
+function applyExternalDocumentUpdate(editorView, nextText) {
+  if (typeof nextText !== "string") {
+    return;
+  }
+
+  const currentText = editorView.state.doc.toString();
+  if (nextText === currentText) {
+    return;
+  }
+
+  const change = getMinimalTextChange(currentText, nextText);
+  const selection = editorView.state.selection.main;
+  const scrollTop = editorView.scrollDOM.scrollTop;
+  const scrollLeft = editorView.scrollDOM.scrollLeft;
+
+  // VS Code sends full-document updates after saves and external file changes.
+  // Apply only the minimal text change so CodeMirror can keep undo history,
+  // IME state, and the visible scroll position stable.
+  applyingExternalUpdate = true;
+  try {
+    editorView.dispatch({
+      changes: change,
+      selection: {
+        anchor: mapPositionThroughTextChange(
+          selection.anchor,
+          change,
+          currentText.length,
+          nextText.length,
+        ),
+        head: mapPositionThroughTextChange(
+          selection.head,
+          change,
+          currentText.length,
+          nextText.length,
+        ),
+      },
+    });
+  } finally {
+    applyingExternalUpdate = false;
+  }
+
+  requestAnimationFrame(() => {
+    editorView.scrollDOM.scrollTop = scrollTop;
+    editorView.scrollDOM.scrollLeft = scrollLeft;
+  });
+}
+
+window.addEventListener("click", (event) => {
+  if (!event.target.closest(".cm-table-context-menu")) {
+    closeTableContextMenu();
+  }
+  if (!event.target.closest(".richdown-outline-root")) {
+    outlineNavigation.close();
+  }
+  if (event.target.closest(".cm-settings-root")) return;
+  const menu = document.querySelector(".cm-settings-menu");
+  if (menu) menu.hidden = true;
+});
+
+window.addEventListener("blur", () => {
+  slashCommands.close();
+  closeTableContextMenu();
+  previewExtensions.exitDetailsEditMode(view, true);
+  previewExtensions.exitFrontmatterEditMode(view, true);
+  previewExtensions.exitTableEditMode(view, true);
+  previewExtensions.exitMermaidEditMode(view, true);
+});
+
+window.addEventListener(
+  "keydown",
+  (event) => {
+    if (
+      event.key === "Escape" &&
+      closeTableContextMenu({ restoreFocus: true })
+    ) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+  },
+  true,
+);
